@@ -1,9 +1,11 @@
 import sys
 sys.path.append("..")
 
-from fastapi import Depends, HTTPException, status, APIRouter, Request
+from fastapi import Depends, HTTPException, status, APIRouter, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from starlette import status
+from starlette.responses import RedirectResponse
 from typing import Union
 from database import engine, SessionLocal
 from sqlalchemy.orm import Session
@@ -19,6 +21,7 @@ router = APIRouter(
 
 models.Base.metadata.create_all(bind=engine)
 
+#For directing the api to the html templates. This is the dir.
 templates = Jinja2Templates(directory="templates")
 
 
@@ -50,139 +53,100 @@ def get_db():
     finally:
         db.close()
 
-#(Schema) The request body that can be sent to our API.
-class Todo(BaseModel):
-    title: str
-    description: Union[str, None] = None
-    priority: int = Field(ge=1, le=5, description="Priority must be between 1-5")
-    complete: bool
+
+@router.get("/", response_class=HTMLResponse)
+async def read_all_by_user(request: Request, db: Session = Depends(get_db)):
+
+    user_todos = db.query(models.ToDos).filter(models.ToDos.owner_id == 1).all()
+
+    "Sends api request and returns the home with the layout given in home.html."
 
 
-class UpdateTodo(BaseModel):
-    title: Union[str, None] = None
-    description: Union[str, None] = None
-    priority: Union[int, None] = Field(default=None, ge=1, le=5, description="Priority must be between 1-5")
-    complete: Union[bool, None] = None
-
-@router.get("/test")
-async def test(request: Request):
-    return templates.TemplateResponse("home.html", {"request": request})
-
-#Parameter shows that the database session depends on the get_db function (It will run it so we have db connection)
-@router.get("/")
-async def read_all(db: Session = Depends(get_db)):
-    return db.query(models.ToDos).all() #Runs a query to the database table given in models.ToDos. The query is to return everything with .all().
-    #Like saying SELECT * FROM todos
+    return templates.TemplateResponse("home.html", {"request": request, "todos": user_todos})
 
 
-@router.get("/{todo_id}")
-async def get_todo(todo_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Establishes connection to the database and tries to fetch todo given the id
-    Relies on (Depends) establishing connection with the db, given by the get_db function
+@router.get("/add-todo", response_class=HTMLResponse)
+async def add_new_todo(request: Request):
+    return templates.TemplateResponse("add-todo.html", {"request": request})
+
+@router.post("/add-todo", response_class=HTMLResponse)
+async def create_todo(
+    request: Request,
+    title: str = Form(...), 
+    description: str = Form(...),
+    priority: int = Form(...),
+    db: Session = Depends(get_db)):
+
+    todo_model = models.ToDos()
+
+    todo_model.title = title
+    todo_model.description = description
+    todo_model.priority = priority
+    todo_model.complete = False
+    todo_model.owner_id = 1
+
+    db.add(todo_model)
+    db.commit()
+
+    #The return call redirects and calls a get request after the api-post method has been called
+    return RedirectResponse(url="/todos", status_code=status.HTTP_302_FOUND)
+
+@router.get("/edit-todo/{todo_id}", response_class=HTMLResponse)
+async def edit_todo(request: Request, todo_id: int, db: Session = Depends(get_db)):
+
+    todo = db.query(models.ToDos).filter(models.ToDos.todo_id == todo_id).first()
+
+    return templates.TemplateResponse("edit-todo.html", {"request":request, "todo": todo})
+
+@router.post("/edit-todo/{todo_id}", response_class=HTMLResponse)
+async def edit_todo_commit(
+    request: Request,
+    todo_id: int,
+    title: str = Form(...),
+    description: str = Form(...),
+    priority: int = Form(...),
+    db: Session = Depends(get_db)):
+
+    todo_model = db.query(models.ToDos).filter(models.ToDos.todo_id == todo_id).first()
+
+    todo_model.title = title
+    todo_model.description = description
+    todo_model.priority = priority
+
+    db.add(todo_model)
+    db.commit()
+
+    return RedirectResponse(url="/todos", status_code=status.HTTP_302_FOUND)
+
+#Since it is a fullstack application it will use http method get instead of post since we are calling the application
+#And the delete function is handled within the edit-todo.html instead.
+@router.get("/delete/{todo_id}")
+async def delete_todo(request: Request, todo_id: int, db: Session = Depends(get_db)):
+
+    todo_model = db.query(models.ToDos).filter(models.ToDos.todo_id == todo_id).filter(models.ToDos.owner_id == 1).first()
+
+    if todo_model is None:
+        return RedirectResponse(url="/todos", status_code=status.HTTP_302_FOUND)
     
-    ------
-    Parameters
-    todo_id - int of the todo id
+    db.query(models.ToDos).filter(models.ToDos.todo_id == todo_id).delete()
+
+    db.commit()
+
+    return RedirectResponse(url="/todos", status_code=status.HTTP_302_FOUND)
+
+
+@router.get("/complete/{todo_id}", response_class=HTMLResponse)
+async def complete_todo(request: Request, todo_id: int, db: Session = Depends(get_db)):
+
+    todo = db.query(models.ToDos).filter(models.ToDos.todo_id == todo_id).first()
+
+    #Will switch the complete bool (if currently False -> True and vice versa)
+    todo.complete = not todo.complete 
+
+    db.add(todo)
+    db.commit()
+
+    return RedirectResponse(url="/todos", status_code=status.HTTP_302_FOUND)
+
+
     
-    Returns
-    The todo with the given todo id
-    """
-    if user is None:
-        return get_user_exception()
-
-    todo_model = (
-        db.query(models.ToDos) #Queries the table given in models.ToDos
-        .filter(models.ToDos.todo_id == todo_id)
-        .filter(models.ToDos.user_id == user.get("user_id")) #Filters the query, kind of the WHERE clause in SQL (WHERE todo_id = id)
-        .first() #Retrives the first hit in db. Like FIRST in SQL
-    )
-
-    if todo_model: #If it's found it returns the todo
-        return todo_model
-    
-    raise http_exception_404(todo_id) #If it's not found it raises 404.
-
-@router.get("/user")
-async def read_all_by_user(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-
-    if user is None:
-        raise get_user_exception()
-    
-    return db.query(models.ToDos).filter(models.ToDos.owner_id == user.get("user_id")).all()
-
-
-@router.post("/", status_code=status.HTTP_201_CREATED)
-async def add_todo(todo: Todo, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-
-    if user is None:
-        raise get_user_exception()
-    
-    todo_model = models.ToDos() #Instantiates the ToDo class from the models module. So we can call it's attributes which
-    #are linked to a column in the database table
-
-    #Below adds entries from the todo request body.
-    todo_model.title = todo.title
-    todo_model.description = todo.description
-    todo_model.priority = todo.priority
-    todo_model.complete = todo.complete
-    todo_model.owner_id = user.get("user_id") #takes the user_id from the authenticated user. All above are from request body
-
-    db.add(todo_model) #Adds the model in a queue to be added to the database.
-    db.commit() #Flushes the queue above and adds it to database.
-
-    return {
-        "To Do added succesfully": todo
-    }
-
-
-@router.put("/{todo_id}")
-async def update_todo(todo_id: int, todo: UpdateTodo, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-
-    if user is None:
-        raise get_user_exception()
-
-    todo_model = (
-        db.query(models.ToDos)
-        .filter(models.ToDos.todo_id == todo_id)
-        .filter(models.ToDos.owner_id == user.get("user_id"))
-        .first()
-    )
-
-    if todo_model:
-        if todo.title:
-            todo_model.title = todo.title
-        if todo.description:
-            todo_model.description = todo.description
-        if todo.priority:
-            todo_model.priority = todo.priority
-        if todo.complete:
-            todo_model.complete = todo.complete
-
-        db.add(todo_model)
-        db.commit()
-        
-        return {"Message": f"To Do {todo_id} changed!"} if not todo.complete else {"Message": f"To Do {todo_id} complete!"}
-
-    return http_exception_404(todo_id)
-
-@router.delete("/{todo_id}")
-async def delete_todo(todo_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-
-    if user is None:
-        raise get_user_exception()
-
-    todo_model = (
-        db.query(models.ToDos)
-        .filter(models.ToDos.todo_id == todo_id)
-        .filter(models.ToDos.owner_id == user.get("user_id"))
-        .first()
-    )
-
-    if todo_model:
-        db.query(models.ToDos).filter(models.ToDos.todo_id == todo_id).delete()
-        db.commit()
-
-        return {"Message": f"To Do {todo_id} was deleted"}
-    
-    return http_exception_404(todo_id)
